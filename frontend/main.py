@@ -8,9 +8,9 @@ import json
 from typing import Dict, Any
 from deep_translator import GoogleTranslator
 import re
+import os
 
 # ===================== Configuration =====================
-import os
 API_BASE_URL = os.getenv("API_BASE_URL", "http://localhost:8000")
 
 st.set_page_config(

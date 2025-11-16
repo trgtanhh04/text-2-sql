@@ -12,6 +12,6 @@ USER = os.getenv("USER", "")
 PASSWORD = os.getenv("PASSWORD", "")
 SSLMODE = os.getenv("SSLMODE", "require")
 DATABASE_URL = os.getenv("DATABASE_URL", f"postgresql://{USER}:{PASSWORD}@{HOST}/{DBNAME}?sslmode={SSLMODE}&channel_binding=require")
-
+API_BASE_URL = os.getenv("API_BASE_URL", "http://localhost:8000")
 print("Configuration loaded:")
 print(f"DATABASE_URL: {DATABASE_URL}")
