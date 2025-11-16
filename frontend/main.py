@@ -10,7 +10,8 @@ from deep_translator import GoogleTranslator
 import re
 
 # ===================== Configuration =====================
-API_BASE_URL = "http://localhost:8000"
+import os
+API_BASE_URL = os.getenv("API_BASE_URL", "http://localhost:8000")
 
 st.set_page_config(
     page_title="Phân tích Text-to-SQL",
