@@ -7,22 +7,22 @@ from typing import List, Tuple
 # =========================
 # 1) SELECTOR (rule-based)
 # =========================
-DATE_WORDS = r"(ngày|date|transaction_date|tháng|month|năm|year|quý|quarter)"
-BUYER_WORDS = r"(khách hàng|buyer|customer|người mua|tên|name|first_name|last_name)"
-LOC_WORDS = r"(địa điểm|location|buyer_location|thành phố|city|San Jose|Houston|Chicago)"
-PRODUCT_WORDS = r"(sản phẩm|product|product_code|Pro\d+|hàng hóa)"
-PAYMENT_WORDS = r"(thanh toán|payment|payment_method|credit card|debit card|cash|mobile payment)"
-QUANTITY_WORDS = r"(số lượng|quantity|quantity_purchased|mua|purchased)"
-REP_WORDS = r"(nhân viên|sales_representative|rep|người bán|đại diện)"
-GENDER_WORDS = r"(giới tính|gender|male|female|nam|nữ)"
-AGE_WORDS = r"(tuổi|age|date_of_birth|sinh nhật|ngày sinh)"
+DATE_WORDS = r"(date|transaction_date|month|year|quarter|when|time)"
+BUYER_WORDS = r"(buyer|customer|name|first_name|last_name|who|person)"
+LOC_WORDS = r"(location|buyer_location|city|where|place|San Jose|Houston|Chicago|Dallas|Phoenix)"
+PRODUCT_WORDS = r"(product|product_code|Pro\d+|item|goods)"
+PAYMENT_WORDS = r"(payment|payment_method|credit card|debit card|cash|mobile payment|paid|pay)"
+QUANTITY_WORDS = r"(quantity|quantity_purchased|amount|purchased|sold|sales)"
+REP_WORDS = r"(sales_representative|representative|rep|salesperson|employee)"
+GENDER_WORDS = r"(gender|male|female|sex)"
+AGE_WORDS = r"(age|date_of_birth|birth|born|old)"
 
 def selector_lite(user_query: str) -> Tuple[List[str], str]:
     """
-    Trả về (danh_sách_bảng_cần, hints chuỗi) dựa theo từ khóa.
+    Returns (list_of_tables, hints_string) based on keywords.
     """
     uq = user_query.lower()
-    tables = {"sales_data"}  # mặc định luôn cần bảng sales_data
+    tables = {"sales_data"}  # always need sales_data table
 
     hints = []
 
@@ -70,7 +70,7 @@ def selector_lite(user_query: str) -> Tuple[List[str], str]:
 # ===============================
 EXAMPLES = [
     (
-        "Tìm giao dịch ở San Jose với thanh toán bằng thẻ tín dụng",
+        "Find transactions in San Jose with credit card payment",
         """SELECT buyer_first_name || ' ' || buyer_last_name AS buyer_name,
                buyer_location,
                payment_method,
@@ -83,7 +83,7 @@ EXAMPLES = [
         LIMIT 50;"""
     ),
     (
-        "Tổng số lượng bán theo sản phẩm",
+        "Total quantity sold by product",
         """SELECT product_code,
                SUM(quantity_purchased) AS total_quantity
         FROM sales_data

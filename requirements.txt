@@ -1,0 +1,13 @@
+sqlalchemy
+sqlglot
+langchain-google-genai
+psycopg2-binary
+unidecode
+plotly
+kaleido
+pandas
+fastapi
+uvicorn[standard]
+streamlit
+requests
+deep-translator

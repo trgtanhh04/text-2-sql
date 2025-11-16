@@ -5,34 +5,57 @@ import os
 import re
 import sys
 import logging
-from dataclasses import dataclass
 from typing import List, Dict, Tuple, Any, Optional
-from sqlalchemy.orm import Session
 
 import sqlglot
 import sqlglot.expressions as exp
 from sqlalchemy import create_engine, text as sa_text
 from sqlalchemy.engine import Engine
+from sqlalchemy.pool import QueuePool
 from unidecode import unidecode
 from langchain_core.messages import HumanMessage
-from langchain_deepseek import ChatDeepSeek
+from langchain_google_genai import ChatGoogleGenerativeAI
 
-from .selector_and_prompt import build_schema_prompt, selector_lite
-from .schema_utils import load_schema, render_schema, SchemaSummary
-from ..config.config import DATABASE_URL, GEMINI_API_KEY
+try:
+    from .selector_and_prompt import build_schema_prompt, selector_lite
+    from .schema_utils import load_schema, render_schema, SchemaSummary
+    from ..config.config import DATABASE_URL, GEMINI_API_KEY
+except ImportError:
+    sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from core.selector_and_prompt import build_schema_prompt, selector_lite
+    from core.schema_utils import load_schema, render_schema, SchemaSummary
+    from config.config import DATABASE_URL, GEMINI_API_KEY
 
-
-# ===================== Logging =====================
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
-log = logging.getLogger("scan-cv.sql")
+log = logging.getLogger("text2sql")
+
+
+# ===================== Global Engine (Connection Pool) =====================
+_global_engine: Optional[Engine] = None
+
+def get_engine() -> Engine:
+    """Get or create a global engine with connection pooling."""
+    global _global_engine
+    if _global_engine is None:
+        _global_engine = create_engine(
+            DATABASE_URL,
+            poolclass=QueuePool,
+            pool_size=5,         
+            max_overflow=10,       
+            pool_pre_ping=True,   
+            pool_recycle=3600,
+            future=True
+        )
+    return _global_engine
+
 
 
 # ===================== LLM Adapter =====================
 class LLM:
-    """Thin wrapper để trích SQL từ LLM output (gỡ ```sql ... ```)."""
+    """Thin wrapper to extract SQL from LLM output (removes ```sql ... ``` markers)."""
     def __init__(self, invoke_fn):
         self._invoke = invoke_fn
 
@@ -50,23 +73,11 @@ FORBIDDEN   = re.compile(
 )
 
 def sql_guard(sql: str) -> None:
-    """Chỉ cho phép SELECT và chặn từ khóa nguy hiểm."""
+    """Only allow SELECT queries and block dangerous keywords."""
     if not SAFE_SELECT.search(sql):
         raise ValueError("Only SELECT queries are allowed.")
     if FORBIDDEN.search(sql):
         raise ValueError("Dangerous SQL keyword detected.")
-
-def _extract_tables(sql: str) -> List[str]:
-    """
-    Parse SQL properly to get real table names.
-    Avoids false positives like EXTRACT(YEAR FROM AGE(...)) where 'FROM AGE' confused regex.
-    """
-    try:
-        node = sqlglot.parse_one(sql, read="postgres")
-        return [t.this.name for t in node.find_all(exp.Table)]
-    except Exception:
-        # fail-soft: return empty (better than wrong)
-        return []
 
 def _extract_qualified_cols(sql: str) -> List[Tuple[str, str]]:
     """
@@ -76,7 +87,6 @@ def _extract_qualified_cols(sql: str) -> List[Tuple[str, str]]:
     try:
         node = sqlglot.parse_one(sql, read="postgres")
         for col in node.find_all(exp.Column):
-            # col.table is Identifier or None; col.name is column name
             table_name = None
             if col.table:
                 if isinstance(col.table, exp.Identifier):
@@ -135,7 +145,6 @@ def schema_guard(sql: str, schema: 'SchemaSummary') -> Optional[str]:
             if alias_name:
                 alias_map[alias_name] = real_name
         else:
-            # allow referencing table by its own name as "alias" too
             alias_map[real_name] = real_name
 
     # unknown tables?
@@ -144,7 +153,7 @@ def schema_guard(sql: str, schema: 'SchemaSummary') -> Optional[str]:
         return f"Unknown tables: {unknown_tbls}. Allowed: {sorted(known_tables)}."
 
     # qualified columns check
-    bad_cols: List[Tuple[str, str, str]] = []  # (alias_or_table, real_table, col)
+    bad_cols: List[Tuple[str, str, str]] = []  
     for alias, col in set(_extract_qualified_cols(sql)):
         alias_str = str(alias)
         real_table = alias_map.get(alias_str, alias_str)
@@ -181,90 +190,6 @@ def refine_prompt(schema_txt: str, user_query: str, prev_sql: str, reason: str) 
 
         Please return ONLY a corrected PostgreSQL SELECT query (no explanation).
     """.strip()
-
-
-# ===================== DISTINCT/EXISTS post-process =====================
-def _root_select(node: exp.Expression) -> Optional[exp.Select]:
-    return node if isinstance(node, exp.Select) else node.find(exp.Select)
-
-def _find_alias_for_table(sel: exp.Select, table_name: str) -> Optional[str]:
-    from_ = sel.find(exp.From)
-    if not from_:
-        return None
-    for t in from_.find_all(exp.Table):
-        if t.this and t.this.name == table_name:
-            return t.alias_or_name
-    return None
-
-def _has_group_by(sel: exp.Select) -> bool:
-    return sel.find(exp.Group) is not None
-
-def _has_any_join(sel: exp.Select) -> bool:
-    return sel.find(exp.Join) is not None
-
-def _has_count_agg(sel: exp.Select) -> bool:
-    return any(isinstance(fn, exp.Count) for fn in sel.find_all(exp.Count))
-
-def _select_refs_other_tables(sel: exp.Select, base_alias: str) -> bool:
-    for item in sel.expressions:
-        node = item.this if isinstance(item, exp.Alias) else item
-        if isinstance(node, exp.Star):
-            return True
-        if isinstance(node, exp.Column) and node.table and node.table != base_alias:
-            return True
-    return False
-
-def _first_table_alias(sel: exp.Select, table_name: str) -> Optional[str]:
-    for t in sel.find_all(exp.Table):
-        if t.this and t.this.name == table_name:
-            return t.alias_or_name
-    return None
-
-def _ordered(expr_node: exp.Expression, desc: bool = False) -> exp.Ordered:
-    return exp.Ordered(this=expr_node, desc=bool(desc))
-
-def _ensure_order_by_prefix(sel: exp.Select,
-                            first_terms: List[exp.Ordered],
-                            extra_terms: Optional[List[exp.Ordered]] = None) -> None:
-    ob = sel.args.get("order")
-    existing = list(ob.expressions) if ob else []
-
-    def _exists_eq(term: exp.Ordered) -> bool:
-        return any(str(t.sql()) == str(term.sql()) for t in existing)
-
-    new_terms: List[exp.Ordered] = []
-    for t in first_terms:
-        if not _exists_eq(t):
-            new_terms.append(t)
-    new_terms.extend(existing)
-    if extra_terms:
-        for t in extra_terms:
-            if not _exists_eq(t):
-                new_terms.append(t)
-
-    sel.set("order", exp.Order(expressions=new_terms))
-
-def _supports_distinct_on() -> bool:
-    return hasattr(exp, "DistinctOn")  # sqlglot >= 28
-
-def _inject_distinct_on(sql_text: str, cand_alias: str) -> str:
-    if re.search(r'(?i)\bselect\s+distinct\s+on\s*\(', sql_text):
-        return sql_text
-    return re.sub(r'(?i)\bselect\s+distinct\b',
-                  f"SELECT DISTINCT ON ({cand_alias}.id)",
-                  sql_text,
-                  count=1)
-
-def postprocess_sql(sql: str) -> str:
-    """
-    Rule for sales_data:
-    - Basic cleanup and validation
-    - For sales_data, usually no special postprocessing needed as it's a single table
-    - Just return the SQL as-is after basic validation
-    """
-    # For sales transaction data, we typically don't need complex DISTINCT logic
-    # as used in multi-table candidate queries
-    return sql
 
 
 # ===================== Fallbacks & helpers =====================
@@ -306,15 +231,7 @@ def _fallback_sql_sales_product(products: List[str], limit: int) -> str:
         """.strip()
 
 
-# ===================== Orchestrator =====================
-@dataclass
-class AnswerResult:
-    sql: str
-    columns: List[str]
-    rows: List[List[Any]]
-    trials: List[Tuple[str, str]]
-    warning: Optional[str] = None
-
+# ===================== Main Query Orchestrator =====================
 def answer_sql(
     engine: Engine,
     llm: LLM,
@@ -335,13 +252,12 @@ def answer_sql(
 
     for attempt in range(max_refine + 1):
         try:
-            # ---- Guards
             sql_guard(sql)
 
             warn = schema_guard(sql, schema)
             if warn and "Unknown tables:" in warn and attempt < max_refine:
                 missing = _extract_missing_tables_from_warn(warn)
-                schema = load_schema(engine, only=None)              # widen once
+                schema = load_schema(engine, only=None)         
                 schema_txt = render_schema(schema)
 
                 if _db_has_tables(schema, missing):
@@ -354,37 +270,23 @@ def answer_sql(
                         sql = _fallback_sql_sales_product(product_terms, limit)
                         warn = None
                     else:
-                        pretty_sql = postprocess_sql(sql)
                         return {
-                            "sql": pretty_sql, 
+                            "sql": sql, 
                             "columns": [], 
                             "rows": [],
                             "trials": trials + [(sql, warn)], 
                             "warning": warn,
                         }
 
-            # ---- Post-process + Execute
-            sql = postprocess_sql(sql)
-            # log.info("[answer_sql] EXEC_SQL:\n%s", sql)
-
             cols, raw_rows = run_sql(engine, sql)
-            # log.info("[answer_sql] RES rows=%d cols=%d", len(raw_rows), len(cols or []))
             cols = list(cols or [])
 
-            # ---- Convert rows to list format for JSON serialization
-            # For sales_data, we don't need special enrichment like resume URLs
             packed_rows: List[List[Any]] = [list(row) for row in raw_rows]
 
-
-            # ---- Empty -> refine
             if len(packed_rows) == 0 and attempt < max_refine:
                 trials.append((sql, "empty result"))
                 sql = llm.gen(refine_prompt(schema_txt, user_query, sql, "empty result"))
                 continue
-            
-            print("Final SQL:", sql)
-            print("Final Columns:", cols)
-            print("Final Rows:", packed_rows)
 
             return {"sql": sql, "columns": cols, "rows": packed_rows, "trials": trials}
 
@@ -400,23 +302,45 @@ def answer_sql(
                     "warning": "Query failed at execution. Returned empty result.",
                 }
 
-if __name__ == "__main__":
-
-    engine = create_engine(DATABASE_URL, future=True)
-
-    # Note: Using Gemini API for text-to-sql
-    from langchain_google_genai import ChatGoogleGenerativeAI
+# ===================== Main Function for API Usage =====================
+def text_to_sql(user_query: str, max_refine: int = 1, limit: int = 10) -> Dict[str, Any]:
+    engine = get_engine()
+    gemini = ChatGoogleGenerativeAI(model="gemini-2.5-flash", google_api_key=GEMINI_API_KEY)
     
-    gemini = ChatGoogleGenerativeAI(model="gemini-pro", google_api_key=GEMINI_API_KEY)
     def _invoke(prompt: str) -> str:
         resp = gemini.invoke([HumanMessage(content=prompt)])
         return resp.content
-
+    
     llm = LLM(_invoke)
+    return answer_sql(engine, llm, user_query, max_refine=max_refine, limit=limit)
 
-    q = "Find total sales quantity by product code"
-    result = answer_sql(engine, llm, q, max_refine=1)
-    print("SQL:\n", result["sql"])
-    print("Columns:", result["columns"])
-    print("Results:", result["rows"])
-    print("Trials:", result["trials"])
+
+if __name__ == "__main__":
+    # Test the function
+    test_queries = [
+        "Find total sales quantity by product code",
+        "Show top 5 sales representatives",
+        "Average quantity by gender"
+    ]
+    
+    for i, q in enumerate(test_queries, 1):
+        print(f"\n{'='*80}")
+        print(f"QUERY {i}: {q}")
+        print('='*80)
+        
+        result = text_to_sql(q, max_refine=1, limit=10)
+        
+        print("\nGenerated SQL:")
+        print(result["sql"])
+        print(f"\nColumns: {result['columns']}")
+        print(f"\nResults (first 5):")
+        for j, row in enumerate(result["rows"][:5], 1):
+            print(f"  {j}. {row}")
+        print(f"\nTotal rows returned: {len(result['rows'])}")
+        
+        if result.get("trials"):
+            print(f"Trials: {len(result['trials'])}")
+    
+    print(f"\n{'='*80}")
+    print("✓ All queries completed using connection pool")
+    print('='*80)
